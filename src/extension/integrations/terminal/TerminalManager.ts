@@ -107,41 +107,36 @@ export class TerminalManager {
       terminalInfo.busy = false;
     });
 
-    // if shell integration is not available, remove terminal so it does not get reused as it may be running a long-running process
-    terminalProcess.once("no_shell_integration", () => {
-      console.log(`no_shell_integration received for terminal ${terminalInfo.id}`);
-      // Remove the terminal so we can't reuse it (in case it's running a long-running process)
-      TerminalRegistry.removeTerminal(terminalInfo.id);
-      this.terminalIds.delete(terminalInfo.id);
-      this.processes.delete(terminalInfo.id);
-    });
-
     const promise = new Promise<void>((resolve, reject) => {
+      let cleanupTimeout: NodeJS.Timeout;
+
+      const cleanup = () => {
+        if (cleanupTimeout) {
+          clearTimeout(cleanupTimeout);
+        }
+      };
+
       terminalProcess.once("continue", () => {
+        cleanup();
         resolve();
       });
+
       terminalProcess.once("error", (error) => {
+        cleanup();
         console.error(`Error in terminal ${terminalInfo.id}:`, error);
         reject(error);
       });
+
+      // Set timeout for command execution
+      cleanupTimeout = setTimeout(() => {
+        const error = new Error(`Command execution timeout: ${command}`);
+        terminalProcess.emit("error", error);
+      }, 30000); // 30 second timeout
     });
 
-    // if shell integration is already active, run the command immediately
-    if (terminalInfo.terminal.shellIntegration) {
-      terminalProcess.waitForShellIntegration = false;
-      terminalProcess.run(terminalInfo.terminal, command);
-    }
-    else {
-      // docs recommend waiting 3s for shell integration to activate
-      pWaitFor(() => terminalInfo.terminal.shellIntegration !== undefined, { timeout: 4000 })
-        .finally(() => {
-          const existingProcess = this.processes.get(terminalInfo.id);
-          if (existingProcess && existingProcess.waitForShellIntegration) {
-            existingProcess.waitForShellIntegration = false;
-            existingProcess.run(terminalInfo.terminal, command);
-          }
-        });
-    }
+    // Run command immediately
+    terminalProcess.waitForShellIntegration = false;
+    terminalProcess.run(terminalInfo.terminal, command);
 
     return mergePromise(terminalProcess, promise);
   }

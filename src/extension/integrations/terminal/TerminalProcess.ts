@@ -112,116 +112,106 @@ export class TerminalProcess extends EventEmitter<TerminalProcessEvents> {
   }
 
   async run(terminal: vscode.Terminal, command: string) {
-    if (terminal.shellIntegration?.executeCommand) {
-      const execution = terminal.shellIntegration.executeCommand(command);
-      const stream = execution.read();
-      let isFirstChunk = true;
-      let didOutputNonCommand = false;
-      let didEmitEmptyLine = false;
+    // Create a unique marker for command output
+    const startMarker = `START_CMD_${Date.now()}`;
+    const endMarker = `END_CMD_${Date.now()}`;
+    
+    // Wrap the command with echo markers for output capture
+    const wrappedCommand = `
+echo "${startMarker}";
+{ ${command}; } 2>&1;
+EXIT_CODE=$?;
+echo "${endMarker}";
+exit $EXIT_CODE
+`.trim();
 
-      for await (let data of stream) {
-        if (isFirstChunk) {
-          const outputBetweenSequences = extractVsCodeCommandOutput(data);
-          const lastMatch = [...data.matchAll(regexes.VS_CODE_SEQUENCE)].pop();
+    let outputStarted = false;
+    let outputBuffer = "";
 
-          if (lastMatch?.index !== undefined) {
-            data = data.slice(lastMatch.index + lastMatch[0].length);
-          }
-
-          if (outputBetweenSequences) {
-            data = `${outputBetweenSequences}\n${data}`;
-          }
-          data = stripAnsi(data)
-            .split("\n")
-            .map((line, index) => {
-              if (index === 0 && line[0] === line[1]) {
-                line = line.slice(1);
-              }
-              return line.replace(regexes.LEADING_NON_ALPHANUMERIC, "");
-            })
-            .join("\n");
-          isFirstChunk = false;
-        }
-        else {
-          data = stripAnsi(data)
-            .split("\n")
-            .map(line => line.replace(regexes.NON_PRINTABLE, ""))
-            .join("\n");
-        }
-
-        if (!didOutputNonCommand) {
-          const lines = data.split("\n");
-          for (let i = 0; i < lines.length; i++) {
-            if (command.includes(lines[i].trim())) {
-              lines.splice(i, 1);
-              i--;
-            }
-            else {
-              didOutputNonCommand = true;
-              break;
-            }
-          }
-          data = lines.join("\n");
-        }
-
-        data = data.replace(regexes.RANDOM_COMMAS, "");
-
-        const compilingMarkers = [
-          "compiling",
-          "building",
-          "bundling",
-          "transpiling",
-          "generating",
-          "starting"
-        ];
-        const markerNullifiers = [
-          "compiled",
-          "success",
-          "finish",
-          "complete",
-          "succeed",
-          "done",
-          "end",
-          "stop",
-          "exit",
-          "terminate",
-          "error",
-          "fail"
-        ];
-
-        const isCompiling
-          = compilingMarkers.some(marker =>
-            data.toLowerCase().includes(marker.toLowerCase())
-          )
-          && !markerNullifiers.some(nullifier =>
-            data.toLowerCase().includes(nullifier.toLowerCase())
-          );
-
-        this.updateHotState(isCompiling);
-
-        if (!didEmitEmptyLine && !this.fullOutput && data) {
-          this.emit("line", "");
-          didEmitEmptyLine = true;
-        }
-
-        this.fullOutput += data;
-        if (this.isListening) {
-          this.emitIfEol(data);
-          this.lastRetrievedIndex = this.fullOutput.length - this.buffer.length;
-        }
+    // Set up output handling
+    const outputHandler = terminal.onDidWriteData((data: string) => {
+      const sanitizedData = stripAnsi(data);
+      
+      if (sanitizedData.includes(startMarker)) {
+        outputStarted = true;
+        return;
       }
 
-      this.emitRemainingBufferIfListening();
-      this.lastActivityTime = 0;
-      this.emit("completed");
-      this.emit("continue");
+      if (sanitizedData.includes(endMarker)) {
+        outputStarted = false;
+        // Process any remaining output
+        if (outputBuffer) {
+          this.processOutput(outputBuffer);
+        }
+        outputHandler.dispose();
+        this.emit("completed");
+        this.emit("continue");
+        return;
+      }
+
+      if (outputStarted) {
+        outputBuffer += sanitizedData;
+        // Process complete lines
+        const lines = outputBuffer.split("\n");
+        if (lines.length > 1) {
+          // Process all complete lines except the last one
+          for (let i = 0; i < lines.length - 1; i++) {
+            this.processOutput(lines[i]);
+          }
+          // Keep the incomplete line in the buffer
+          outputBuffer = lines[lines.length - 1];
+        }
+      }
+    });
+
+    // Execute the wrapped command
+    terminal.sendText(wrappedCommand, true);
+  }
+
+  private processOutput(data: string) {
+    if (!data.trim()) return;
+
+    const sanitizedOutput = sanitizeOutput(data);
+    if (sanitizedOutput) {
+      this.fullOutput += sanitizedOutput + "\n";
+      if (this.isListening) {
+        this.emit("line", sanitizedOutput);
+      }
     }
-    else {
-      terminal.sendText(command, true);
-      this.emit("completed");
-      this.emit("continue");
-      this.emit("no_shell_integration");
-    }
+
+    // Update hot state based on output content
+    const compilingMarkers = [
+      "compiling",
+      "building",
+      "bundling",
+      "transpiling",
+      "generating",
+      "starting"
+    ];
+    const markerNullifiers = [
+      "compiled",
+      "success",
+      "finish",
+      "complete",
+      "succeed",
+      "done",
+      "end",
+      "stop",
+      "exit",
+      "terminate",
+      "error",
+      "fail"
+    ];
+
+    const isCompiling =
+      compilingMarkers.some(marker =>
+        data.toLowerCase().includes(marker.toLowerCase())
+      ) &&
+      !markerNullifiers.some(nullifier =>
+        data.toLowerCase().includes(nullifier.toLowerCase())
+      );
+
+    this.updateHotState(isCompiling);
   }
 }
 
