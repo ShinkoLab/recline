@@ -25,14 +25,18 @@ export class VSCodeLmModelProvider implements ModelProvider {
   private configurationWatcher: vscode.Disposable | null;
   private currentRequestCancellation: vscode.CancellationTokenSource | null;
   private options: ApiHandlerOptions;
-  private systemPromptTokenCache: Map<string, number>;
+
+  // This is a non-persistent cache that stores the token count.
+  // It's used to avoid redundant token counting for the same text content.
+  // The cache is active during the lifecycle of the provider instance. (usually the lifetime of a task-run)
+  private temporaryTokenCache: Map<string, number>;
 
   constructor(options: ApiHandlerOptions) {
     this.options = options;
     this.client = null;
     this.configurationWatcher = null;
     this.currentRequestCancellation = null;
-    this.systemPromptTokenCache = new Map();
+    this.temporaryTokenCache = new Map();
 
     this.configurationWatcher = vscode.workspace.onDidChangeConfiguration((event: vscode.ConfigurationChangeEvent) => {
       if (event.affectsConfiguration("lm")) {
@@ -43,34 +47,55 @@ export class VSCodeLmModelProvider implements ModelProvider {
   }
 
   private async calculateInputTokens(systemPrompt: string, messages: MessageParamWithTokenCount[]): Promise<number> {
-    let totalTokens = 0;
-    const systemPromptHash = createHash("sha1").update(systemPrompt).digest("base64");
-    if (!this.systemPromptTokenCache.has(systemPromptHash)) {
-      const tokenCount = await this.countTokens(systemPrompt);
-      this.systemPromptTokenCache.set(systemPromptHash, tokenCount);
-    }
-    totalTokens += this.systemPromptTokenCache.get(systemPromptHash)!;
 
+    let totalTokens: number = 0;
+
+    // Calculate the token count for the system prompt.
+    const systemPromptCacheKey: string = this.getTemporaryTokenCacheKey(systemPrompt);
+    if (!this.temporaryTokenCache.has(systemPromptCacheKey)) {
+      const tokenCount: number = await this.countTokens(systemPrompt);
+      this.temporaryTokenCache.set(systemPromptCacheKey, tokenCount);
+      totalTokens += tokenCount;
+    }
+    else {
+      totalTokens += this.temporaryTokenCache.get(systemPromptCacheKey) ?? 0;
+    }
+
+    // Calculate the token count for the messages.
     for (const msg of messages) {
-      if (msg.tokenCount !== undefined) {
+
+      // 1. If the tokenCount is stored in the message, use it.
+      if (msg.tokenCount != null) {
         totalTokens += msg.tokenCount;
+        continue;
       }
-      else {
-        // Handle case where msg.tokenCount is not defined
-        // This should be rare if token counts are stored persistently
-        const messageContent = Array.isArray(msg.content)
-          ? msg.content.filter(block => block.type === "text").map(block => block.text).join("\n")
-          : msg.content;
-        const tokenCount = await this.countTokens(messageContent);
-        totalTokens += tokenCount;
+
+      // Extract the text content from the message.
+      const messageContent = Array.isArray(msg.content)
+        ? msg.content
+          .filter(block => block.type === "text")
+          .map(block => block.text)
+          .join("\n")
+        : msg.content;
+
+      // 2. If the tokenCount is somehow not stored in the message, query the temporary cache as fallback.
+      const messageCacheKey: string = this.getTemporaryTokenCacheKey(messageContent);
+      if (this.temporaryTokenCache.has(messageCacheKey)) {
+        totalTokens += this.temporaryTokenCache.get(messageCacheKey) ?? 0;
+        continue;
       }
+
+      // 3. If the tokenCount is not stored in the message and the temporary cache, calculate it. (This is the most expensive case.)
+      const tokenCount: number = await this.countTokens(messageContent);
+      this.temporaryTokenCache.set(messageCacheKey, tokenCount);
+      totalTokens += tokenCount;
     }
 
     return totalTokens;
   }
 
   private async countTokens(text: string): Promise<number> {
-    if (!this.client || !this.currentRequestCancellation) {
+    if ((!this.client || !this.currentRequestCancellation?.token) || this.currentRequestCancellation.token.isCancellationRequested) {
       return 0;
     }
 
@@ -111,16 +136,16 @@ export class VSCodeLmModelProvider implements ModelProvider {
         yield { type: "text", text: chunk.value };
       }
     }
-
-    this.releaseCurrentCancellation();
   }
 
   private releaseCurrentCancellation(): void {
-    if (this.currentRequestCancellation) {
-      this.currentRequestCancellation.cancel();
-      this.currentRequestCancellation.dispose();
-      this.currentRequestCancellation = null;
+    if (!this.currentRequestCancellation) {
+      return;
     }
+
+    this.currentRequestCancellation.cancel();
+    this.currentRequestCancellation.dispose();
+    this.currentRequestCancellation = null;
   }
 
   private async selectBestModel(selector: vscode.LanguageModelChatSelector): Promise<vscode.LanguageModelChat> {
@@ -133,12 +158,17 @@ export class VSCodeLmModelProvider implements ModelProvider {
   }
 
   async *createMessage(systemPrompt: string, messages: MessageParamWithTokenCount[]): ApiStream {
+
+    // Ensure the previous request is cancelled before starting a new one.
     this.releaseCurrentCancellation();
+
     const client = await this.getClient();
     const model = await this.getModel();
     this.currentRequestCancellation = new vscode.CancellationTokenSource();
 
-    const totalInputTokens = await this.calculateInputTokens(systemPrompt, messages);
+    // Start counting the input tokens parallel to the request. (Promise is created, but not awaited)
+    const totalInputTokensPromise: Promise<number> = this.calculateInputTokens(systemPrompt, messages);
+
     const vsCodeLmMessages = [
       vscode.LanguageModelChatMessage.User(systemPrompt),
       ...convertToVsCodeLmMessages(messages)
@@ -152,17 +182,25 @@ export class VSCodeLmModelProvider implements ModelProvider {
     );
 
     const streamGenerator = this.processStreamChunks(response, contentBuilder);
-    for await (const chunk of streamGenerator) {
-      yield chunk;
-    }
+    yield * streamGenerator;
 
     if (!this.currentRequestCancellation?.token.isCancellationRequested) {
-      const outputTokens = await this.countTokens(contentBuilder.join(""));
+
+      // Ensure all token counting is completed before calculating the cost and yielding usage.
+      const [inputTokens, outputTokens] = await Promise.all([
+        totalInputTokensPromise,
+        this.countTokens(contentBuilder.join(""))
+      ]);
+
       yield {
         type: "usage",
-        inputTokens: totalInputTokens,
+        inputTokens,
         outputTokens,
-        totalCost: calculateApiCost(model.info, totalInputTokens, outputTokens)
+        totalCost: calculateApiCost(
+          model.info,
+          inputTokens,
+          outputTokens
+        )
       };
     }
   }
@@ -176,7 +214,7 @@ export class VSCodeLmModelProvider implements ModelProvider {
     }
 
     this.client = null;
-    this.systemPromptTokenCache.clear();
+    this.temporaryTokenCache.clear();
   }
 
   async getModel(): Promise<{ id: string; info: ModelInfo }> {
@@ -192,5 +230,10 @@ export class VSCodeLmModelProvider implements ModelProvider {
         outputPrice: 0
       }
     };
+  }
+
+  getTemporaryTokenCacheKey(value: string): string {
+    // TODO: Consider using a more efficient/performant hash function.
+    return createHash("sha1").update(value).digest("base64");
   }
 }
